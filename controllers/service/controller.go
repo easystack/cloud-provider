@@ -58,6 +58,8 @@ const (
 	// ToBeDeletedTaint is a taint used by the CLuster Autoscaler before marking a node for deletion. Defined in
 	// https://github.com/kubernetes/autoscaler/blob/e80ab518340f88f364fe3ef063f8303755125971/cluster-autoscaler/utils/deletetaint/delete.go#L36
 	ToBeDeletedTaint = "ToBeDeletedByClusterAutoscaler"
+
+	ServiceAnnotationLoadBalancerDirectPodIP = "loadbalancer.openstack.org/direct-pod-ip"
 )
 
 type cachedService struct {
@@ -90,6 +92,11 @@ type Controller struct {
 	// services that need to be synced
 	queue workqueue.RateLimitingInterface
 
+	endpointLister       corelisters.EndpointsLister
+	endpointListerSynced cache.InformerSynced
+	// endpoints that need to be synced
+	endpointsQueue workqueue.RateLimitingInterface
+
 	// nodeSyncLock ensures there is only one instance of triggerNodeSync getting executed at one time
 	// and protects internal states (needFullSync) of nodeSync
 	nodeSyncLock sync.Mutex
@@ -106,6 +113,7 @@ func New(
 	kubeClient clientset.Interface,
 	serviceInformer coreinformers.ServiceInformer,
 	nodeInformer coreinformers.NodeInformer,
+	endpointInformer coreinformers.EndpointsInformer,
 	clusterName string,
 	featureGate featuregate.FeatureGate,
 ) (*Controller, error) {
@@ -134,6 +142,9 @@ func New(
 		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "service"),
 		// nodeSyncCh has a size 1 buffer. Only one pending sync signal would be cached.
 		nodeSyncCh: make(chan interface{}, 1),
+		endpointLister:   endpointInformer.Lister(),
+		endpointListerSynced: endpointInformer.Informer().HasSynced,
+		endpointsQueue:   workqueue.NewNamedRateLimitingQueue(workqueue.NewItemExponentialFailureRateLimiter(minRetryDelay, maxRetryDelay), "endpoint"),
 	}
 
 	serviceInformer.Informer().AddEventHandlerWithResyncPeriod(
@@ -160,6 +171,10 @@ func New(
 	)
 	s.serviceLister = serviceInformer.Lister()
 	s.serviceListerSynced = serviceInformer.Informer().HasSynced
+
+	endpointInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: s.updateEndpoint,
+	})
 
 	nodeInformer.Informer().AddEventHandlerWithResyncPeriod(
 		cache.ResourceEventHandlerFuncs{
@@ -189,7 +204,6 @@ func New(
 		},
 		time.Duration(0),
 	)
-
 	if err := s.init(); err != nil {
 		return nil, err
 	}
@@ -229,6 +243,7 @@ func (s *Controller) enqueueService(obj interface{}) {
 func (s *Controller) Run(ctx context.Context, workers int) {
 	defer runtime.HandleCrash()
 	defer s.queue.ShutDown()
+	defer s.endpointsQueue.ShutDown()
 
 	klog.Info("Starting service controller")
 	defer klog.Info("Shutting down service controller")
@@ -239,6 +254,7 @@ func (s *Controller) Run(ctx context.Context, workers int) {
 
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, s.worker, time.Second)
+		go wait.UntilWithContext(ctx, s.endpointWorker, time.Second)
 	}
 
 	go s.nodeSyncLoop(ctx, workers)
@@ -282,6 +298,50 @@ func (s *Controller) triggerNodeSync() {
 func (s *Controller) worker(ctx context.Context) {
 	for s.processNextWorkItem(ctx) {
 	}
+}
+
+// endpointWorker runs a worker thread that just dequeues items, processes them, and marks them done.
+// It enforces that the syncHandler is never invoked concurrently with the same key.
+func (s *Controller) endpointWorker(ctx context.Context) {
+	for s.processNextEndpointWorkItem(ctx) {
+	}
+}
+
+func (s *Controller) processNextEndpointWorkItem(ctx context.Context) bool {
+	key, quit := s.endpointsQueue.Get()
+	if quit {
+		return false
+	}
+	defer s.endpointsQueue.Done(key)
+
+	err := s.updateService(ctx, key.(string))
+	if err == nil {
+		s.endpointsQueue.Forget(key)
+		return true
+	}
+
+	runtime.HandleError(fmt.Errorf("error updating endpoints for service %v (will retry): %v", key, err))
+	s.endpointsQueue.AddRateLimited(key)
+	return true
+}
+
+// updateService will call updateLoadBalancer to update pool members
+func (s *Controller) updateService(ctx context.Context, key string) error {
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return err
+	}
+	service, err := s.serviceLister.Services(namespace).Get(name)
+	if err != nil {
+		klog.Errorf("Failed to get service %s with error %v", name, err)
+		return err
+	}
+
+	var emptyNodes [] *v1.Node
+	err = s.balancer.UpdateLoadBalancer(ctx, s.clusterName, service, emptyNodes)
+
+	return err
 }
 
 // nodeSyncLoop takes nodeSync signal and triggers nodeSync
@@ -539,6 +599,11 @@ func needsCleanup(service *v1.Service) bool {
 
 // needsUpdate checks if load balancer needs to be updated due to change in attributes.
 func (s *Controller) needsUpdate(oldService *v1.Service, newService *v1.Service) bool {
+	klog.Infof("&&&&&&&&&&& if service updated old: %v, new: %v", oldService, newService)
+	if !reflect.DeepEqual(oldService, newService) {
+		klog.Infof("&&&&&&&&&&& not equal &&&&&&&&&&&&7")
+	}
+
 	if !wantsLoadBalancer(oldService) && !wantsLoadBalancer(newService) {
 		return false
 	}
@@ -598,6 +663,49 @@ func (s *Controller) needsUpdate(oldService *v1.Service, newService *v1.Service)
 	}
 
 	return false
+}
+
+// updateEndpoint
+func (s *Controller) updateEndpoint(old, new interface{}){
+	oldep := old.(*v1.Endpoints)
+	newep := new.(*v1.Endpoints)
+
+	klog.Infof("******* old Endpoints %v", oldep)
+	klog.Infof("####### new Endpoints %v", newep)
+
+	// service of the endpoint
+	name := newep.Name
+	namespace := newep.Namespace
+
+	service, err := s.serviceLister.Services(namespace).Get(name)
+
+	if errors.IsNotFound(err) {
+		klog.Warningf("Failed to get service %s with error %v, do not need update service", name, err)
+		return
+	} else if err != nil {
+		klog.Errorf("Failed to get service %s with error %v", name, err)
+		return
+	}
+
+	if service.Spec.Type == v1.ServiceTypeLoadBalancer {
+		if annotationValue, ok := service.Annotations[ServiceAnnotationLoadBalancerDirectPodIP]; ok && annotationValue == "true" {
+			if !reflect.DeepEqual(oldep.Subsets, newep.Subsets) {
+				klog.Infof("!!!!!!!!!!!!!! Need to update service %s", name)
+				s.enqueueEndpoint(new)
+			}
+		}
+	}
+}
+
+// obj could be an *v1.Endpoints, or a DeletionFinalStateUnknown marker item.
+func (s *Controller) enqueueEndpoint(obj interface{}) {
+	klog.Infof("UUUUUUUUUUUUUUUUUUUUUUUU update endpoint %s", obj)
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		runtime.HandleError(fmt.Errorf("couldn't get key for object %#v: %v", obj, err))
+		return
+	}
+	s.endpointsQueue.Add(key)
 }
 
 func getPortsForLB(service *v1.Service) []*v1.ServicePort {
@@ -764,6 +872,10 @@ func (s *Controller) nodeSyncInternal(ctx context.Context, workers int) {
 // nodeSyncService syncs the nodes for one load balancer type service
 func (s *Controller) nodeSyncService(svc *v1.Service) bool {
 	if svc == nil || !wantsLoadBalancer(svc) {
+		return false
+	}
+	if svc.Annotations[ServiceAnnotationLoadBalancerDirectPodIP] == "true" {
+		klog.Infof("service %s/%s is direct-pod-ip mode, skip sync nodes", svc.Namespace, svc.Name)
 		return false
 	}
 	klog.V(4).Infof("nodeSyncService started for service %s/%s", svc.Namespace, svc.Name)
